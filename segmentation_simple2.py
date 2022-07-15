@@ -1,4 +1,5 @@
 import faulthandler
+from functools import partial
 import glob
 import gzip
 import os
@@ -11,6 +12,7 @@ import h5py
 import numpy as np
 import pandas as pd
 import PIL.Image
+import skimage.morphology
 import sklearn.metrics
 import supervisely as sly
 import tqdm
@@ -28,8 +30,11 @@ from segmenter import (
     NullFeatures,
     Segmenter,
 )
+from envparse import env
 
 faulthandler.enable()
+
+N_JOBS = env("N_JOBS", cast=int, default=1)
 
 
 def files_df(pattern, name):
@@ -191,7 +196,29 @@ def extract_features(trial: Trial):
     return {"time_calculate_features": time_calculate_features}
 
 
-def _build_trainingset(features_h5, dataset, preselector):
+def _augment_classes(classes, bg_margin=0, bg_width=0):
+    """
+    Set pixels to background (0) around any foreground objects (1).
+    """
+    foreground = classes == 1
+    if bg_margin:
+        margin = skimage.morphology.binary_dilation(
+            foreground, skimage.morphology.disk(bg_margin)
+        )
+    else:
+        margin = foreground
+
+    background = (
+        skimage.morphology.binary_dilation(margin, skimage.morphology.disk(bg_width))
+        & ~margin
+    )
+
+    classes[background] = 0
+
+    return classes
+
+
+def _build_trainingset(features_h5, dataset, preselector, bg_margin=0, bg_width=0):
     X = []
     y = []
     for row in tqdm.tqdm(
@@ -205,6 +232,9 @@ def _build_trainingset(features_h5, dataset, preselector):
 
         # Load precalculated features
         features: np.ndarray = features_h5[row.Index][:]  # type: ignore
+
+        # TODO: Grow annotated area around objects
+        classes = _augment_classes(classes, bg_margin, bg_width)
 
         # Select only annotated pixels
         mask = classes >= 0
@@ -258,14 +288,18 @@ def train(trial: Trial):
     classifier = trial.prefixed("classifier_").call(classifier_cls)
 
     # Configure classifier for training
-    _configure(classifier, n_jobs=-1, verbose=1)
+    _configure(classifier, n_jobs=N_JOBS, verbose=1)
 
     trial.save()
 
     # Build training set
     features_fn = extract_features_trial.find_file("features.h5")
     with h5py.File(features_fn, "r") as features_h5:
-        X, y = _build_trainingset(features_h5, dataset, preselector)
+        X, y = trial.prefixed("tset_").call(
+            partial(_build_trainingset, features_h5, dataset, preselector)
+        )
+
+    trial.save()
 
     assert X.shape[0] == y.shape[0], f"X: {X.shape}, y: {y.shape}"
 
@@ -415,7 +449,7 @@ def run_stage(
     return sub_trial
 
 
-# max_depth
+# prepare_train_min_intensity=24,
 @Experiment(
     configurator=Const(
         dataset_path="data/22-06-14-LOKI",
@@ -426,8 +460,16 @@ def run_stage(
         extract_features_edges=True,
         extract_features_intensity=True,
         extract_features_texture=True,
+        # Training set preparation
+        train_tset_bg_margin=3,
+        train_tset_bg_width=15,
+        # Preselector
+        train_preselector="MinIntensityPreSelector",
+        train_preselector_min_intensity=24,
         # Classifier
+        train_classifier="RandomForestClassifier",
         train_classifier_max_depth=10,
+        train_classifier_n_estimators=10,
     )
 )
 def train_eval(trial: Trial):
