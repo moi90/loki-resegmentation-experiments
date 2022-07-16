@@ -1,21 +1,26 @@
 import faulthandler
-from functools import partial
 import glob
 import gzip
 import os
 import pickle
+from functools import partial
 from time import time
-from typing import Mapping, Optional
-
+from typing import List, Mapping, Optional
+import skimage.color
 import experitur
 import h5py
 import numpy as np
 import pandas as pd
 import PIL.Image
+import scipy.optimize
+import shapely.geometry
+import skimage.io
+import skimage.measure
 import skimage.morphology
 import sklearn.metrics
 import supervisely as sly
 import tqdm
+from envparse import env
 from experitur import Experiment, Trial
 from experitur.core.configurators import Const
 from experitur.core.context import get_current_context
@@ -25,12 +30,12 @@ from sklearn.svm import LinearSVC
 from timer_cm import Timer
 
 from segmenter import (
+    DefaultPostProcessor,
     MinIntensityPreSelector,
     MultiscaleBasicFeatures,
     NullFeatures,
     Segmenter,
 )
-from envparse import env
 
 faulthandler.enable()
 
@@ -125,11 +130,13 @@ def dataset(trial: Trial):
                 elif label.obj_class.name == background_class:
                     class_image[sl][mask] = 0
 
+            assert (class_image == 1).any(), f"{item_name} has no foreground"
+
             labels_fn = os.path.join(labels_dir, item_id + ".np.gz")
             save_gz(labels_fn, label_image)
 
             classes_fn = os.path.join(classes_dir, item_id + ".np.gz")
-            save_gz(classes_fn, label_image)
+            save_gz(classes_fn, class_image)
 
             data[item_id] = dict(
                 image_fn=dset.get_img_path(item_name),
@@ -165,6 +172,13 @@ def dataset(trial: Trial):
     data.to_csv(os.path.join(trial.wdir, "dataset.csv"))
 
 
+def gz_dump(filename, obj):
+    with gzip.open(filename, "wb") as f:
+        s = pickle.dumps(obj)
+        f.write(s)
+        return len(s)
+
+
 @Experiment()
 def extract_features(trial: Trial):
     dataset_trial = experitur.get_trial(trial["dataset_trial_id"])
@@ -174,9 +188,7 @@ def extract_features(trial: Trial):
     feature_extractor = trial.call(cls)
 
     # Save feature extractor
-    feature_extractor_fn = trial.file("feature_extractor.pkl.gz")
-    with gzip.open(feature_extractor_fn, "wb") as f:
-        pickle.dump(feature_extractor, f)
+    gz_dump(trial.file("feature_extractor.pkl.gz"), feature_extractor)
 
     trial.save()
 
@@ -260,15 +272,19 @@ def train(trial: Trial):
     extract_features_trial = experitur.get_trial(trial["extract_features_trial_id"])
     dataset_trial = experitur.get_trial(extract_features_trial["dataset_trial_id"])
     dataset = pd.read_csv(dataset_trial.find_file("dataset.csv"), index_col=0)
-    split = trial.get("split", None)
 
+    split = trial.get("split", None)
     if split is None:
-        print(f"Training on complete dataset ({len(dataset):,d} samples)")
+        print("Training on complete dataset")
     else:
         dataset = dataset[dataset["split"] != split]
-        print(
-            f"Training on training split ({split}) dataset ({len(dataset):,d} samples)"
-        )
+        print(f"Training on training split ({split}) dataset")
+
+    fast_n = trial.get("fast_n", None)
+    if fast_n is not None:
+        dataset = dataset.iloc[:fast_n]
+
+    print(f"{len(dataset)} samples")
 
     preselector_cls = trial.choice("preselector", [None, MinIntensityPreSelector])
     preselector = (
@@ -278,9 +294,7 @@ def train(trial: Trial):
     )
 
     # Save preselector
-    preselector_fn = trial.file("preselector.pkl.gz")
-    with gzip.open(preselector_fn, "wb") as f:
-        pickle.dump(preselector, f)
+    gz_dump(trial.file("preselector.pkl.gz"), preselector)
 
     classifier_cls = trial.choice(
         "classifier", [RandomForestClassifier, LinearSVC, DummyClassifier]
@@ -299,6 +313,9 @@ def train(trial: Trial):
             partial(_build_trainingset, features_h5, dataset, preselector)
         )
 
+    # Check that y consists only of back- and foreground
+    np.testing.assert_array_equal(np.unique(y), np.array([0, 1]))
+
     trial.save()
 
     assert X.shape[0] == y.shape[0], f"X: {X.shape}, y: {y.shape}"
@@ -314,10 +331,8 @@ def train(trial: Trial):
     with Timer("train") as t_fit:
         classifier.fit(X, y)
 
-    # Save preselector
-    classifier_fn = trial.file("classifier.pkl.gz")
-    with gzip.open(classifier_fn, "wb") as f:
-        pickle.dump(classifier, f)
+    # Save classifier
+    classifier_size = gz_dump(trial.file("classifier.pkl.gz"), classifier)
 
     print("Evaluating classifier...")
     with Timer("predict") as t_predict:
@@ -341,15 +356,144 @@ def train(trial: Trial):
         "f_score": f_score,
         "accuracy": accuracy,
         "support": support,
+        "classifier_size": classifier_size,
     }
 
 
+def intersection_over_union(y_true: np.ndarray, y_pred: np.ndarray):
+    # Intersection-over-union of two binary classifications
+    assert y_true.dtype == np.dtype("bool")
+    assert y_pred.dtype == np.dtype("bool")
+
+    return (y_true & y_pred).sum() / (y_true | y_pred).sum()
+
+
+def bbox_iou(bbox1, bbox2):
+    # min_row, min_col, max_row, max_col
+
+    bbox1 = shapely.geometry.box(*bbox1)
+    bbox2 = shapely.geometry.box(*bbox2)
+
+    return bbox1.intersection(bbox2).area / bbox1.union(bbox2).area
+
+
 def _evaluate_segments(labels_true, labels_pred):
-    ...
+    # Clustering metrics
+    common_foreground = (labels_true > 0) & (labels_pred > 0)
+    (
+        homogeneity,
+        completeness,
+        v_score,
+    ) = sklearn.metrics.homogeneity_completeness_v_measure(
+        labels_true[common_foreground], labels_pred[common_foreground]
+    )
+
+    # Region-based metrics
+    regions_true: List[
+        skimage.measure._regionprops.RegionProperties
+    ] = skimage.measure.regionprops(labels_true)
+    regions_pred: List[
+        skimage.measure._regionprops.RegionProperties
+    ] = skimage.measure.regionprops(labels_pred)
+
+    # Match labels (excluding background)
+    # (Ensure that every true segment receives a match)
+    n_true = len(regions_true)
+    n_pred = len(regions_pred)
+    ious = np.zeros((n_true, max(n_true, n_pred)))
+    for i, r_true in enumerate(regions_true):
+        for j, r_pred in enumerate(regions_pred):
+            ious[i, j] = intersection_over_union(
+                labels_true == r_true.label, labels_pred == r_pred.label
+            )
+
+    # Match best regions
+    ii, jj = scipy.optimize.linear_sum_assignment(ious, maximize=True)
+    assert len(ii) == n_true
+
+    # Mean IoU
+    # (Requires a match for every true segment)
+    mean_iou = ious[ii, jj].mean()
+
+    # Calculate BBox IoU
+    mean_bbox_iou = np.mean(
+        [bbox_iou(regions_true[i].bbox, regions_pred[j].bbox) for i, j in zip(ii, jj)]
+    )
+
+    # Precision / Recall
+    iou_true = np.zeros(n_true)
+    iou_true[ii] = ious[ii, jj]
+    iou_pred = np.zeros(n_pred)
+    iou_pred[jj] = ious[ii, jj]
+
+    precision = (iou_pred > 0.5).sum()
+    recall = (iou_true > 0.5).sum()
+    _denom = precision + recall
+    f1_score = 2 * precision * recall / (_denom if _denom > 0 else 1)
+
+    return {
+        "homogeneity": homogeneity,
+        "completeness": completeness,
+        "v_score": v_score,
+        "mean_iou": mean_iou,
+        "mean_bbox_iou": mean_bbox_iou,
+        "label_precision": precision,
+        "label_recall": recall,
+        "label_f1_score": f1_score,
+    }
 
 
 def _evaluate_classes(classes_true, classes_pred):
-    ...
+    mask = classes_true > -1
+
+    # Pixel-level evaluation
+    y_true = classes_true[mask].astype(bool)
+    y_pred = classes_pred[mask].astype(bool)
+
+    (
+        precision,
+        recall,
+        f1_score,
+        support,
+    ) = sklearn.metrics.precision_recall_fscore_support(
+        y_true, y_pred, average="binary"
+    )
+
+    accuracy = sklearn.metrics.accuracy_score(y_true, y_pred)
+
+    # Foreground evaluation
+    fg_true = classes_true == 1
+    fg_pred = classes_pred == 1
+
+    iou = intersection_over_union(fg_true, fg_pred)
+
+    return {
+        "px_precision": precision,
+        "px_recall": recall,
+        "px_f1_score": f1_score,
+        "px_support": support,
+        "px_accuracy": accuracy,
+        "px_iou": iou,
+    }
+
+
+def draw_segmentation(image: np.ndarray, y_true: np.ndarray, y_pred: np.ndarray):
+    assert y_true.dtype == np.dtype(
+        "bool"
+    ), f"Unexpected dtype for y_true: {y_true.dtype}"
+    assert y_pred.dtype == np.dtype(
+        "bool"
+    ), f"Unexpected dtype for y_pred: {y_pred.dtype}"
+
+    # Assemble label image
+    label_image = np.zeros(image.shape[:2], dtype="uint8")
+    label_image[y_true & y_pred] = 1  # TP
+    label_image[y_true & (~y_pred)] = 2  # FN
+    label_image[(~y_true) & y_pred] = 3  # FP
+
+    return skimage.color.label2rgb(
+        label_image, image, colors=["cyan", "magenta", "yellow"], alpha=0.5
+    )
 
 
 @Experiment()
@@ -372,12 +516,14 @@ def evaluate_postprocessor(trial: Trial):
         preselector = pickle.load(f)
 
     # Load classifier
-    classifier_fn = extract_features_trial.find_file("classifier.pkl.gz")
+    classifier_fn = train_trial.find_file("classifier.pkl.gz")
     with gzip.open(classifier_fn, "rb") as f:
         classifier = pickle.load(f)
 
+    _configure(classifier, n_jobs=1, verbose=0)
+
     # Initialize postprocessor
-    postprocessor_cls = trial.choice("postprocessor", [])
+    postprocessor_cls = trial.choice("postprocessor", [DefaultPostProcessor])
     postprocessor = trial.prefixed("postprocessor_").call(postprocessor_cls)
 
     segmenter = Segmenter(
@@ -389,40 +535,66 @@ def evaluate_postprocessor(trial: Trial):
 
     split = trial.get("split", None)
     if split is None:
-        print(f"Evaluating on complete dataset ({len(dataset):,d} samples)")
+        print("Evaluating on complete dataset")
     else:
         dataset = dataset[dataset["split"] != split]
-        print(
-            f"Evaluating on training split ({split}) dataset ({len(dataset):,d} samples)"
-        )
+        print(f"Evaluating on training split ({split}) dataset")
 
-    features_fn = extract_features_trial.find_file("features.h5")
-    with h5py.File(features_fn, "r") as features_h5:
-        for row in tqdm.tqdm(
-            dataset.itertuples(), desc="Building validation set...", total=len(dataset)
-        ):
-            image = np.array(PIL.Image.open(row.image_fn).convert("L"))
+    fast_n = trial.get("fast_n", None)
+    if fast_n is not None:
+        dataset = dataset.iloc[:fast_n]
 
-            # Classes: Each pixel is assigned a class
-            # TODO: Meaning of values?
-            classes: np.ndarray = load_gz(row.classes_fn)
+    print(f"{len(dataset)} samples")
 
-            # Each pixel is assigned a segment
-            labels: np.ndarray = load_gz(row.labels_fn)
+    with Timer("eval_val") as t:
+        results = []
+        with h5py.File(
+            extract_features_trial.find_file("features.h5"), "r"
+        ) as features_h5:
+            for row in tqdm.tqdm(
+                dataset.itertuples(), desc="Validating...", total=len(dataset)
+            ):
+                image = np.array(PIL.Image.open(row.image_fn).convert("L"))
 
-            # Load precalculated features
-            features: np.ndarray = features_h5[row.Index][:]  # type: ignore
+                # Classes: Each pixel is assigned a class
+                # 0=background, 1=foreground, -1=ignore
+                classes: np.ndarray = load_gz(row.classes_fn)
 
-            # Apply rest of segmentation pipeline
-            mask = segmenter.preselect(image)
-            mask = segmenter.predict_pixels(features, mask)
-            labels_pred = segmenter.postprocess(mask, image)
+                # Each pixel is assigned a segment
+                labels: np.ndarray = load_gz(row.labels_fn)
 
-            # Evaluate
-            _evaluate_classes(classes, labels_pred > 0)
-            _evaluate_segments(labels, labels_pred)
+                # Load precalculated features
+                features: np.ndarray = features_h5[row.Index][:]  # type: ignore
 
-    raise NotImplementedError()
+                # Apply rest of segmentation pipeline
+                mask = segmenter.preselect(image)
+                scores = segmenter.predict_pixels(features, mask)
+                labels_pred = segmenter.postprocess(scores, image)
+
+                # Draw
+                if trial.get("draw_segmentation", False):
+                    img = draw_segmentation(image, classes == 1, labels_pred > 0)
+                    skimage.io.imsave(
+                        trial.file(f"segmentation/{row.Index}.png", True), img
+                    )
+
+                # Evaluate
+                scores_classes = _evaluate_classes(
+                    classes, (labels_pred > 0).astype(int)
+                )
+                scores_labels = _evaluate_segments(labels, labels_pred)
+
+                results.append({"id": row.Index, **scores_classes, **scores_labels})
+
+    time_eval = float(t.elapsed) / len(dataset)
+
+    results = pd.DataFrame(results).set_index("id", drop=True)
+    results.to_csv(trial.file("scores.csv"))
+
+    return {
+        "t_eval": time_eval,
+        **results.mean(axis=0, numeric_only=True).to_dict(),
+    }
 
 
 def run_stage(
@@ -455,6 +627,8 @@ def run_stage(
         dataset_path="data/22-06-14-LOKI",
         dataset_nsplits=5,
         dataset_groupby="node_id",
+        # Debug
+        fast_n=10,
         # Feature Extractor
         extract_features_sigma_max=32,
         extract_features_edges=True,
@@ -470,6 +644,8 @@ def run_stage(
         train_classifier="RandomForestClassifier",
         train_classifier_max_depth=10,
         train_classifier_n_estimators=10,
+        # Evaluation
+        eval_draw_segmentation=True,
     )
 )
 def train_eval(trial: Trial):
@@ -492,6 +668,7 @@ def train_eval(trial: Trial):
             train,
             split=split,
             extract_features_trial_id=extract_features_trial.id,
+            fast_n=trial.get("fast_n"),
         )
 
         eval_trial = run_stage(
@@ -499,6 +676,7 @@ def train_eval(trial: Trial):
             evaluate_postprocessor,
             train_trial_id=train_trial.id,
             split=split,
+            fast_n=trial.get("fast_n"),
         )
 
         results.append(eval_trial.result)

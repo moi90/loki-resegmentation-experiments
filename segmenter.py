@@ -3,6 +3,7 @@ from optparse import Option
 from typing import Optional
 import numpy as np
 import skimage.feature
+import skimage.measure
 
 
 class FeatureExtractor(ABC):
@@ -28,6 +29,8 @@ class MultiscaleBasicFeatures(FeatureExtractor):
         self.sigma_max = sigma_max
         self.num_sigma = num_sigma
 
+        self.n_jobs = 1
+
     def __call__(self, image):
         return skimage.feature.multiscale_basic_features(
             image,
@@ -37,7 +40,7 @@ class MultiscaleBasicFeatures(FeatureExtractor):
             sigma_min=self.sigma_min,
             sigma_max=self.sigma_max,
             num_sigma=self.num_sigma,
-            num_workers=1,
+            num_workers=self.n_jobs,
         )
 
 
@@ -83,7 +86,9 @@ class PostProcessor(ABC):
 
 class DefaultPostProcessor(PostProcessor):
     def __call__(self, scores: np.ndarray, image: np.ndarray) -> np.ndarray:
-        scores
+        del image
+        mask = scores > 0.5
+        return skimage.measure.label(mask)
 
 
 class Segmenter:
@@ -123,10 +128,16 @@ class Segmenter:
     ) -> np.ndarray:
         # features is [h,w,c]
         h, w, c = features.shape
-        X = features[mask] if mask is not None else features.reshape((-1, c))
+
+        if mask is not None:
+            # Predict only masked locations and assemble result
+            prob = self.classifier.predict_proba(features[mask])[:, 1]
+            result = np.zeros((h, w), dtype=prob.dtype)
+            result[mask] = prob
+            return result
 
         # Return probability of foreground in the same shape as the input
-        return self.classifier.predict_proba(X)[:, 1].reshape((h, w))
+        return self.classifier.predict_proba(features)[:, 1].reshape((h, w))
 
     def postprocess(self, mask: np.ndarray, image: np.ndarray):
         return self.postprocessor(mask, image)
