@@ -42,11 +42,15 @@ from segmenter import (
     Segmenter,
 )
 
+from _version import get_versions
+
 faulthandler.enable()
 
 logging.getLogger("imageio").setLevel(logging.ERROR)
 
 N_JOBS = env("N_JOBS", cast=int, default=1)
+
+meta = {"version": get_versions()["version"]}
 
 
 def files_df(pattern, name):
@@ -94,7 +98,7 @@ def load_gz(fn: str, **kwargs) -> np.ndarray:
         return np.load(f, **kwargs)
 
 
-@Experiment()
+@Experiment(meta=meta)
 def dataset(trial: Trial):
 
     project = sly.read_single_project(trial["path"])
@@ -187,7 +191,7 @@ def gz_dump(filename, obj):
         return len(s)
 
 
-@Experiment()
+@Experiment(meta=meta)
 def extract_features(trial: Trial):
     dataset_trial = experitur.get_trial(trial["dataset_trial_id"])
     dataset = pd.read_csv(dataset_trial.find_file("dataset.csv"), index_col=0)
@@ -290,7 +294,7 @@ def _configure(obj, **kwargs):
             setattr(obj, k, v)
 
 
-@Experiment()
+@Experiment(meta=meta)
 def train(trial: Trial):
     extract_features_trial = experitur.get_trial(trial["extract_features_trial_id"])
     dataset_trial = experitur.get_trial(extract_features_trial["dataset_trial_id"])
@@ -550,7 +554,7 @@ def draw_segmentation(image: np.ndarray, y_true: np.ndarray, y_pred: np.ndarray)
     return result
 
 
-@Experiment()
+@Experiment(meta=meta)
 def evaluate_postprocessor(trial: Trial):
     train_trial = experitur.get_trial(trial["train_trial_id"])
     extract_features_trial = experitur.get_trial(
@@ -708,7 +712,8 @@ def run_stage(
         train_classifier="RandomForestClassifier",
         train_classifier_max_depth=10,
         train_classifier_n_estimators=10,
-    )
+    ),
+    meta=meta,
 )
 def train_eval(trial: Trial):
 
