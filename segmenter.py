@@ -4,6 +4,9 @@ from typing import Optional
 import numpy as np
 import skimage.feature
 import skimage.measure
+import skimage.morphology
+import skimage.filters
+import skimage.segmentation
 
 
 class FeatureExtractor(ABC):
@@ -63,13 +66,22 @@ class PreSelector(ABC):
 
 
 class MinIntensityPreSelector(PreSelector):
-    def __init__(self, min_intensity) -> None:
+    def __init__(self, min_intensity, dilate=0) -> None:
         super().__init__()
         self.min_intensity = min_intensity
+        self.dilate = dilate
 
     def __call__(self, image: np.ndarray) -> np.ndarray:
         assert image.ndim == 2
-        return image > self.min_intensity
+
+        mask = image > self.min_intensity
+
+        if self.dilate:
+            mask = skimage.morphology.binary_dilation(
+                mask, skimage.morphology.disk(self.dilate)
+            )
+
+        return mask
 
 
 class PostProcessor(ABC):
@@ -84,11 +96,89 @@ class PostProcessor(ABC):
         raise NotImplementedError()
 
 
+def _label_ex(mask_pred, image, min_size=0, closing=0, min_intensity=0):
+    labels_pred = skimage.measure.label(mask_pred)
+
+    if min_size or min_intensity:
+        # Remove elements with maximum intensity smaller than min_intensity or area smaller than min_size
+        for r in skimage.measure.regionprops(labels_pred, image):
+            if (r.intensity_max < min_intensity) or (r.area < min_size):
+                labels_pred[labels_pred == r.label] = 0
+
+    if closing:
+        # Close and relabel
+        mask_pred = skimage.morphology.binary_closing(
+            labels_pred > 0, skimage.morphology.disk(closing)
+        )
+        labels_pred = skimage.measure.label(mask_pred)
+
+    return labels_pred
+
+
 class DefaultPostProcessor(PostProcessor):
+    def __init__(
+        self, threshold=0.5, smoothing=0, min_size=0, closing=0, min_intensity=0
+    ) -> None:
+        super().__init__()
+
+        self.threshold = threshold
+        self.smoothing = smoothing
+        self.min_size = min_size
+        self.closing = closing
+        self.min_intensity = min_intensity
+
     def __call__(self, scores: np.ndarray, image: np.ndarray) -> np.ndarray:
-        del image
-        mask = scores > 0.5
-        return skimage.measure.label(mask)
+        if self.smoothing:
+            skimage.filters.gaussian(scores, self.smoothing)
+
+        mask_pred = scores > self.threshold
+
+        return _label_ex(
+            mask_pred, image, self.min_size, self.closing, self.min_intensity
+        )
+
+
+class WatershedPostProcessor(PostProcessor):
+    def __init__(
+        self,
+        thr_low=0.5,
+        q_high=0.99,
+        dilate_edges=3,
+        min_size=64,
+        closing=10,
+        min_intensity=64,
+    ) -> None:
+        super().__init__()
+
+        self.thr_low = thr_low
+        self.q_high = q_high
+        self.dilate_edges = dilate_edges
+        self.min_size = min_size
+        self.closing = closing
+        self.min_intensity = min_intensity
+
+    def _edges(self, image: np.ndarray):
+        if self.dilate_edges:
+            image = skimage.morphology.dilation(
+                image, skimage.morphology.disk(self.dilate_edges)
+            )
+        return skimage.filters.sobel(image)
+
+    def __call__(self, scores: np.ndarray, image: np.ndarray) -> np.ndarray:
+        thr_high = np.quantile(scores, self.q_high)
+        markers = np.zeros(scores.shape, dtype="uint8")
+        FOREGROUND, BACKGROUND = 1, 2
+
+        markers[scores > thr_high] = FOREGROUND
+        markers[scores < self.thr_low] = BACKGROUND
+
+        edges = self._edges(image)
+
+        mask_pred = skimage.segmentation.watershed(edges, markers) == FOREGROUND
+
+        return _label_ex(
+            mask_pred, image, self.min_size, self.closing, self.min_intensity
+        )
 
 
 class Segmenter:

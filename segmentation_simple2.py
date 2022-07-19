@@ -1,12 +1,13 @@
 import faulthandler
 import glob
 import gzip
+import logging
 import os
 import pickle
 from functools import partial
 from time import time
 from typing import List, Mapping, Optional
-import skimage.color
+
 import experitur
 import h5py
 import numpy as np
@@ -14,9 +15,11 @@ import pandas as pd
 import PIL.Image
 import scipy.optimize
 import shapely.geometry
+import skimage.color
 import skimage.io
 import skimage.measure
 import skimage.morphology
+import skimage.util
 import sklearn.metrics
 import supervisely as sly
 import tqdm
@@ -28,9 +31,11 @@ from sklearn.dummy import DummyClassifier
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.svm import LinearSVC
 from timer_cm import Timer
+from experitur.configurators import SKOpt
 
 from segmenter import (
     DefaultPostProcessor,
+    WatershedPostProcessor,
     MinIntensityPreSelector,
     MultiscaleBasicFeatures,
     NullFeatures,
@@ -38,6 +43,8 @@ from segmenter import (
 )
 
 faulthandler.enable()
+
+logging.getLogger("imageio").setLevel(logging.ERROR)
 
 N_JOBS = env("N_JOBS", cast=int, default=1)
 
@@ -125,12 +132,13 @@ def dataset(trial: Trial):
                 )
 
                 if label.obj_class.name == foreground_class:
-                    label_image[sl] = mask * i
+                    label_image[sl] = mask * (i + 1)
                     class_image[sl][mask] = 1
                 elif label.obj_class.name == background_class:
                     class_image[sl][mask] = 0
 
-            assert (class_image == 1).any(), f"{item_name} has no foreground"
+            assert (class_image == 1).any(), f"{item_name} has no foreground pixels"
+            assert (class_image > 0).any(), f"{item_name} has no foreground regions"
 
             labels_fn = os.path.join(labels_dir, item_id + ".np.gz")
             save_gz(labels_fn, label_image)
@@ -230,9 +238,17 @@ def _augment_classes(classes, bg_margin=0, bg_width=0):
     return classes
 
 
-def _build_trainingset(features_h5, dataset, preselector, bg_margin=0, bg_width=0):
+def _build_trainingset(
+    features_h5, dataset, preselector, bg_margin=0, bg_width=0, equal_weight=False
+):
     X = []
     y = []
+
+    if equal_weight:
+        sample_weight = []
+    else:
+        sample_weight = None
+
     for row in tqdm.tqdm(
         dataset.itertuples(), desc="Building training set...", total=len(dataset)
     ):
@@ -258,7 +274,14 @@ def _build_trainingset(features_h5, dataset, preselector, bg_margin=0, bg_width=
         X.append(features[mask])
         y.append(classes[mask])
 
-    return np.concatenate(X), np.concatenate(y)
+        if sample_weight is not None:
+            n_samples = mask.sum()
+            sample_weight.append(np.full(n_samples, 1 / n_samples))
+
+    if sample_weight is not None:
+        sample_weight = np.concatenate(sample_weight)
+
+    return (np.concatenate(X), np.concatenate(y), sample_weight)
 
 
 def _configure(obj, **kwargs):
@@ -278,7 +301,7 @@ def train(trial: Trial):
         print("Training on complete dataset")
     else:
         dataset = dataset[dataset["split"] != split]
-        print(f"Training on training split ({split}) dataset")
+        print(f"Training on training split {split}")
 
     fast_n = trial.get("fast_n", None)
     if fast_n is not None:
@@ -309,7 +332,7 @@ def train(trial: Trial):
     # Build training set
     features_fn = extract_features_trial.find_file("features.h5")
     with h5py.File(features_fn, "r") as features_h5:
-        X, y = trial.prefixed("tset_").call(
+        X, y, sample_weight = trial.prefixed("tset_").call(
             partial(_build_trainingset, features_h5, dataset, preselector)
         )
 
@@ -320,16 +343,9 @@ def train(trial: Trial):
 
     assert X.shape[0] == y.shape[0], f"X: {X.shape}, y: {y.shape}"
 
-    preselector_cls = trial.choice("preselector", [None, MinIntensityPreSelector])
-    preselector = (
-        None
-        if preselector_cls is None
-        else trial.prefixed("preselector_").call(preselector_cls)
-    )
-
     print("Fitting classifier...")
     with Timer("train") as t_fit:
-        classifier.fit(X, y)
+        classifier.fit(X, y, sample_weight=sample_weight)
 
     # Save classifier
     classifier_size = gz_dump(trial.file("classifier.pkl.gz"), classifier)
@@ -400,7 +416,10 @@ def _evaluate_segments(labels_true, labels_pred):
     # (Ensure that every true segment receives a match)
     n_true = len(regions_true)
     n_pred = len(regions_pred)
-    ious = np.zeros((n_true, max(n_true, n_pred)))
+
+    assert n_true > 0, "No foreground regions"
+
+    ious = np.zeros((max(n_true, n_pred), max(n_true, n_pred)))
     for i, r_true in enumerate(regions_true):
         for j, r_pred in enumerate(regions_pred):
             ious[i, j] = intersection_over_union(
@@ -409,7 +428,7 @@ def _evaluate_segments(labels_true, labels_pred):
 
     # Match best regions
     ii, jj = scipy.optimize.linear_sum_assignment(ious, maximize=True)
-    assert len(ii) == n_true
+    assert len(ii) == max(n_true, n_pred)
 
     # Mean IoU
     # (Requires a match for every true segment)
@@ -417,17 +436,22 @@ def _evaluate_segments(labels_true, labels_pred):
 
     # Calculate BBox IoU
     mean_bbox_iou = np.mean(
-        [bbox_iou(regions_true[i].bbox, regions_pred[j].bbox) for i, j in zip(ii, jj)]
+        [
+            bbox_iou(regions_true[i].bbox, regions_pred[j].bbox)
+            if i < n_true and j < n_pred
+            else 0
+            for i, j in zip(ii, jj)
+        ]
     )
 
     # Precision / Recall
-    iou_true = np.zeros(n_true)
+    iou_true = np.zeros(max(n_true, n_pred))
     iou_true[ii] = ious[ii, jj]
-    iou_pred = np.zeros(n_pred)
+    iou_pred = np.zeros(max(n_true, n_pred))
     iou_pred[jj] = ious[ii, jj]
 
-    precision = (iou_pred > 0.5).sum()
-    recall = (iou_true > 0.5).sum()
+    precision = (iou_pred > 0.5).sum() / n_pred
+    recall = (iou_true > 0.5).sum() / n_true
     _denom = precision + recall
     f1_score = 2 * precision * recall / (_denom if _denom > 0 else 1)
 
@@ -450,28 +474,53 @@ def _evaluate_classes(classes_true, classes_pred):
     y_true = classes_true[mask].astype(bool)
     y_pred = classes_pred[mask].astype(bool)
 
+    # Evaluate foreground
     (
-        precision,
-        recall,
-        f1_score,
-        support,
+        fg_precision,
+        fg_recall,
+        fg_f1,
+        fg_support,
     ) = sklearn.metrics.precision_recall_fscore_support(
-        y_true, y_pred, average="binary"
+        y_true,
+        y_pred,
+        average="binary",
     )
+
+    # Evaluate background
+    (
+        bg_precision,
+        bg_recall,
+        bg_f1,
+        bg_support,
+    ) = sklearn.metrics.precision_recall_fscore_support(
+        ~y_true,
+        ~y_pred,
+        average="binary",
+        zero_division=1,
+    )
+
+    mean_precision = (fg_precision + bg_precision) / 2
+    mean_recall = (fg_recall + bg_recall) / 2
 
     accuracy = sklearn.metrics.accuracy_score(y_true, y_pred)
 
-    # Foreground evaluation
+    # Evaluate foreground overlap
     fg_true = classes_true == 1
     fg_pred = classes_pred == 1
 
     iou = intersection_over_union(fg_true, fg_pred)
 
     return {
-        "px_precision": precision,
-        "px_recall": recall,
-        "px_f1_score": f1_score,
-        "px_support": support,
+        "px_fg_precision": fg_precision,
+        "px_fg_recall": fg_recall,
+        "px_fg_f1_score": fg_f1,
+        "px_fg_support": fg_support,
+        "px_bg_precision": bg_precision,
+        "px_bg_recall": bg_recall,
+        "px_bg_f1_score": bg_f1,
+        "px_bg_support": bg_support,
+        "px_mean_precision": mean_precision,
+        "px_mean_recall": mean_recall,
         "px_accuracy": accuracy,
         "px_iou": iou,
     }
@@ -491,9 +540,14 @@ def draw_segmentation(image: np.ndarray, y_true: np.ndarray, y_pred: np.ndarray)
     label_image[y_true & (~y_pred)] = 2  # FN
     label_image[(~y_true) & y_pred] = 3  # FP
 
-    return skimage.color.label2rgb(
+    result = skimage.color.label2rgb(
         label_image, image, colors=["cyan", "magenta", "yellow"], alpha=0.5
     )
+
+    # TODO: Convert result back to image.dtype
+    # to avoid Lossy conversion warning
+
+    return result
 
 
 @Experiment()
@@ -523,7 +577,9 @@ def evaluate_postprocessor(trial: Trial):
     _configure(classifier, n_jobs=1, verbose=0)
 
     # Initialize postprocessor
-    postprocessor_cls = trial.choice("postprocessor", [DefaultPostProcessor])
+    postprocessor_cls = trial.choice(
+        "postprocessor", [DefaultPostProcessor, WatershedPostProcessor]
+    )
     postprocessor = trial.prefixed("postprocessor_").call(postprocessor_cls)
 
     segmenter = Segmenter(
@@ -533,12 +589,15 @@ def evaluate_postprocessor(trial: Trial):
         postprocessor=postprocessor,
     )
 
+    # Save segmenter
+    gz_dump(trial.file("segmenter.pkl.gz"), segmenter)
+
     split = trial.get("split", None)
     if split is None:
         print("Evaluating on complete dataset")
     else:
-        dataset = dataset[dataset["split"] != split]
-        print(f"Evaluating on training split ({split}) dataset")
+        dataset = dataset[dataset["split"] == split]
+        print(f"Evaluating on validation split {split}")
 
     fast_n = trial.get("fast_n", None)
     if fast_n is not None:
@@ -575,7 +634,9 @@ def evaluate_postprocessor(trial: Trial):
                 if trial.get("draw_segmentation", False):
                     img = draw_segmentation(image, classes == 1, labels_pred > 0)
                     skimage.io.imsave(
-                        trial.file(f"segmentation/{row.Index}.png", True), img
+                        trial.file(f"segmentation/{row.Index}.png", True),
+                        img,
+                        check_contrast=False,
                     )
 
                 # Evaluate
@@ -628,24 +689,25 @@ def run_stage(
         dataset_nsplits=5,
         dataset_groupby="node_id",
         # Debug
-        fast_n=10,
+        fast_n=None,
+        max_splits=None,
+        eval_draw_segmentation=False,
         # Feature Extractor
         extract_features_sigma_max=32,
         extract_features_edges=True,
         extract_features_intensity=True,
         extract_features_texture=True,
         # Training set preparation
-        train_tset_bg_margin=3,
+        train_tset_bg_margin=5,
         train_tset_bg_width=15,
         # Preselector
         train_preselector="MinIntensityPreSelector",
         train_preselector_min_intensity=24,
+        train_preselector_dilate=20,
         # Classifier
         train_classifier="RandomForestClassifier",
         train_classifier_max_depth=10,
         train_classifier_n_estimators=10,
-        # Evaluation
-        eval_draw_segmentation=True,
     )
 )
 def train_eval(trial: Trial):
@@ -661,8 +723,13 @@ def train_eval(trial: Trial):
         dataset_trial_id=dataset_trial.id,
     )
 
+    n_splits = dataset_trial["nsplits"]
+    max_splits = trial.get("max_splits", None)
+    if max_splits is not None:
+        n_splits = min(n_splits, max_splits)
+
     results = []
-    for split in range(dataset_trial["nsplits"]):
+    for split in range(n_splits):
         train_trial = run_stage(
             trial.prefixed("train_"),
             train,
@@ -682,8 +749,65 @@ def train_eval(trial: Trial):
         results.append(eval_trial.result)
 
     results = pd.DataFrame(results)
-    results.agg(["mean", "std"])
+    results.to_csv(trial.file("results.csv"))
 
-    results.to_pickle(trial.file("results.pkl"))
+    return results.mean().to_dict()
 
-    raise NotImplementedError()
+
+train_eval_optimize = Experiment(
+    parent=train_eval,
+    configurator=[
+        # Only evaluate the first split
+        Const(max_splits=1),
+        # Const(train_preselector_min_intensity=24, train_preselector_dilate=20),
+        SKOpt(
+            {
+                # "train_preselector_dilate": SKOpt.Categorical([None, 20]),
+                "extract_features_intensity": SKOpt.Categorical([True, False]),
+                # "train_preselector_min_intensity": SKOpt.Categorical(
+                #     [24, 32, 36, 48]  # 0, 12,
+                # ),
+                # "train_classifier_n_estimators": SKOpt.Categorical([10, 20, 30]),
+                # "train_classifier_max_depth": SKOpt.Categorical([10, 20, 30, 100]),
+                # "train_tset_bg_margin": SKOpt.Categorical([3, 5, 9]),
+                "train_tset_bg_width": SKOpt.Categorical([7, 15, 31]),
+                "train_tset_equal_weight": SKOpt.Categorical([True, False]),
+                "eval_postprocessor_threshold": SKOpt.Categorical([0.5, 0.75, 0.8]),
+                "eval_postprocessor_smoothing": SKOpt.Categorical([0, 5, 10]),
+            },
+            # objective="px_iou",
+            # objective="px_bg_recall",  # Recognize background (light)
+            # objective="px_mean_recall",  # Optimize recall of foreground and background
+            objective="mean_iou",  # Optimize match of labeled regions
+            n_iter=10,
+        ),
+    ],
+    maximize=["px_iou", "px_bg_recall", "px_mean_recall", "mean_iou"],
+)
+
+train_eval_optimize_watershed = Experiment(
+    parent=train_eval,
+    configurator=[
+        # Only evaluate the first split
+        Const(max_splits=1),
+        Const(eval_postprocessor="WatershedPostProcessor"),
+        SKOpt(
+            {
+                "extract_features_intensity": SKOpt.Categorical([True, False]),
+                "train_tset_bg_width": SKOpt.Categorical([7, 15, 31]),
+                "train_tset_equal_weight": SKOpt.Categorical([True, False]),
+                "eval_postprocessor_thr_low": SKOpt.Categorical([0.25, 0.50, 0.75]),
+                "eval_postprocessor_q_high": SKOpt.Categorical([0.95, 0.99]),
+                "eval_postprocessor_min_size": SKOpt.Categorical([0, 16, 32, 64]),
+                "eval_postprocessor_closing": SKOpt.Categorical([0, 10, 15]),
+                "eval_postprocessor_min_intensity": SKOpt.Categorical([0, 16, 32, 64]),
+            },
+            # objective="px_iou",
+            # objective="px_bg_recall",  # Recognize background (light)
+            # objective="px_mean_recall",  # Optimize recall of foreground and background
+            objective="mean_iou",  # Optimize match of labeled regions
+            n_iter=10,
+        ),
+    ],
+    maximize=["px_iou", "px_bg_recall", "px_mean_recall", "mean_iou"],
+)
