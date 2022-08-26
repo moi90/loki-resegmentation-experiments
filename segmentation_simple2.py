@@ -1,3 +1,4 @@
+from distutils.command.config import config
 import faulthandler
 import glob
 import gzip
@@ -9,6 +10,8 @@ from time import time
 from typing import List, Mapping, Optional
 
 import experitur
+from experitur import configurators
+from experitur.core.experiment import SkipTrial
 import h5py
 import numpy as np
 import pandas as pd
@@ -31,7 +34,7 @@ from sklearn.dummy import DummyClassifier
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.svm import LinearSVC
 from timer_cm import Timer
-from experitur.configurators import SKOpt
+from experitur.configurators import SKOpt, AdditiveConfiguratorChain, RandomGrid
 
 from segmenter import (
     DefaultPostProcessor,
@@ -554,6 +557,25 @@ def draw_segmentation(image: np.ndarray, y_true: np.ndarray, y_pred: np.ndarray)
     return result
 
 
+def summarize(df: pd.DataFrame, percentiles=[0.1, 0.5, 0.9]):
+    """
+    Return a dictionary of summarized values.
+
+    Args:
+        df (pd.DataFrame): Dataframe of shape (n_samples, n_scores).
+
+    Returns:
+        Dictionary of <score>_<min|mean|max|10%|...>: <value>
+    """
+    summary = (
+        df.describe(percentiles=percentiles, include=[np.number])
+        .drop(index=["count"])
+        .unstack()
+    )
+    summary.index = summary.index.map("_".join)
+    return summary.to_dict()
+
+
 @Experiment(meta=meta)
 def evaluate_postprocessor(trial: Trial):
     train_trial = experitur.get_trial(trial["train_trial_id"])
@@ -667,15 +689,12 @@ def run_stage(
 ):
     exp = experiment.child(configurator=Const(trial, **kwargs))
 
-    ctx = get_current_context()
-
     exp.run()
 
     sub_trial = exp.get_matching_trials().one()
 
     while not (sub_trial.is_successful or sub_trial.is_failed or sub_trial.is_zombie):
-        time.sleep(10)
-        sub_trial = ctx.get_trial(sub_trial.id)
+        raise SkipTrial("Already running")
 
     if sub_trial.is_failed or sub_trial.is_zombie:
         raise ValueError(f"Trial {sub_trial.id} was unsuccessful")
@@ -704,6 +723,7 @@ def run_stage(
         # Training set preparation
         train_tset_bg_margin=5,
         train_tset_bg_width=15,
+        train_tset_equal_weight=False,
         # Preselector
         train_preselector="MinIntensityPreSelector",
         train_preselector_min_intensity=24,
@@ -775,7 +795,7 @@ train_eval_optimize = Experiment(
                 # "train_classifier_n_estimators": SKOpt.Categorical([10, 20, 30]),
                 # "train_classifier_max_depth": SKOpt.Categorical([10, 20, 30, 100]),
                 # "train_tset_bg_margin": SKOpt.Categorical([3, 5, 9]),
-                "train_tset_bg_width": SKOpt.Categorical([7, 15, 31]),
+                # "train_tset_bg_width": SKOpt.Categorical([7, 15, 31]),
                 "train_tset_equal_weight": SKOpt.Categorical([True, False]),
                 "eval_postprocessor_threshold": SKOpt.Categorical([0.5, 0.75, 0.8]),
                 "eval_postprocessor_smoothing": SKOpt.Categorical([0, 5, 10]),
@@ -790,28 +810,69 @@ train_eval_optimize = Experiment(
     maximize=["px_iou", "px_bg_recall", "px_mean_recall", "mean_iou"],
 )
 
+
+def _explore_options(options: Mapping, objective):
+    configurators = []
+
+    # Explore individually
+    for k, v in options.items():
+        configurators.append(RandomGrid({k: v}))
+
+    n_total = sum(len(v) for v in options.values())
+
+    # Optimize
+    configurators.append(
+        SKOpt(
+            {k: SKOpt.Categorical(v) for k, v in options.items()},
+            objective=objective,
+            n_iter=n_total,
+        )
+    )
+
+    return AdditiveConfiguratorChain(*configurators, shuffle=True)
+
+
 train_eval_optimize_watershed = Experiment(
     parent=train_eval,
     configurator=[
         # Only evaluate the first split
         Const(max_splits=1),
-        Const(eval_postprocessor="WatershedPostProcessor"),
-        SKOpt(
+        Const(
+            eval_postprocessor="WatershedPostProcessor",
+            eval_postprocessor_closing=15,
+            eval_postprocessor_thr_low=0.25,
+            eval_postprocessor_q_high=0.99,
+            eval_postprocessor_min_intensity=64,
+            eval_postprocessor_min_size=256,
+            eval_postprocessor_dilate_edges=5,
+            train_tset_bg_width=15,
+        ),
+        _explore_options(
             {
-                "extract_features_intensity": SKOpt.Categorical([True, False]),
-                "train_tset_bg_width": SKOpt.Categorical([7, 15, 31]),
-                "train_tset_equal_weight": SKOpt.Categorical([True, False]),
-                "eval_postprocessor_thr_low": SKOpt.Categorical([0.25, 0.50, 0.75]),
-                "eval_postprocessor_q_high": SKOpt.Categorical([0.95, 0.99]),
-                "eval_postprocessor_min_size": SKOpt.Categorical([0, 16, 32, 64]),
-                "eval_postprocessor_closing": SKOpt.Categorical([0, 10, 15]),
-                "eval_postprocessor_min_intensity": SKOpt.Categorical([0, 16, 32, 64]),
+                "eval_postprocessor_min_size": [
+                    0,
+                    16,
+                    32,
+                    64,
+                    96,
+                    128,
+                    160,
+                    256,
+                    384,
+                    512,
+                    1024,
+                ],
+                # "eval_postprocessor_q_high": [0.95, 0.97, 0.99, 0.999],
+                # "eval_postprocessor_min_intensity": [0, 8, 16, 32, 64, 96, 128],
+                # "eval_postprocessor_dilate_edges": [0, 3, 5, 9, 17],
+                "eval_postprocessor_closing": [0, 10, 15, 20, 25, 50, 75, 100],
+                # "train_tset_bg_width": [7, 15, 31],
+                # "eval_postprocessor_thr_low": [0.125, 0.25, 0.50, 0.75]
             },
             # objective="px_iou",
             # objective="px_bg_recall",  # Recognize background (light)
             # objective="px_mean_recall",  # Optimize recall of foreground and background
             objective="mean_iou",  # Optimize match of labeled regions
-            n_iter=10,
         ),
     ],
     maximize=["px_iou", "px_bg_recall", "px_mean_recall", "mean_iou"],

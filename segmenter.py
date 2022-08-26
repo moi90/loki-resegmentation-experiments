@@ -7,9 +7,21 @@ import skimage.measure
 import skimage.morphology
 import skimage.filters
 import skimage.segmentation
+import inspect
+import isotropic
 
 
-class FeatureExtractor(ABC):
+class DefaultReprMixin:
+    def __repr__(self) -> str:
+        params = [
+            f"{p}={getattr(self, p)!r}"
+            for p in inspect.signature(type(self)).parameters.keys()
+            if hasattr(self, p)
+        ]
+        return self.__class__.__name__ + "(" + (", ".join(params)) + ")"
+
+
+class FeatureExtractor(DefaultReprMixin, ABC):
     @abstractmethod
     def __call__(self, image: np.ndarray) -> np.ndarray:
         raise NotImplementedError()
@@ -53,7 +65,7 @@ class NullFeatures(FeatureExtractor):
         return image.reshape(image.shape[:2] + (-1,))
 
 
-class PreSelector(ABC):
+class PreSelector(DefaultReprMixin, ABC):
     """
     Generate a mask from an image.
 
@@ -77,14 +89,12 @@ class MinIntensityPreSelector(PreSelector):
         mask = image > self.min_intensity
 
         if self.dilate:
-            mask = skimage.morphology.binary_dilation(
-                mask, skimage.morphology.disk(self.dilate)
-            )
+            mask = isotropic.isotropic_dilation(mask, self.dilate)
 
         return mask
 
 
-class PostProcessor(ABC):
+class PostProcessor(DefaultReprMixin, ABC):
     """
     Post-process the classifier output to obtain a labeled image.
 
@@ -107,9 +117,7 @@ def _label_ex(mask_pred, image, min_size=0, closing=0, min_intensity=0):
 
     if closing:
         # Close and relabel
-        mask_pred = skimage.morphology.binary_closing(
-            labels_pred > 0, skimage.morphology.disk(closing)
-        )
+        mask_pred = isotropic.isotropic_closing(labels_pred > 0, closing)
         labels_pred = skimage.measure.label(mask_pred)
 
     return labels_pred
@@ -139,6 +147,15 @@ class DefaultPostProcessor(PostProcessor):
 
 
 class WatershedPostProcessor(PostProcessor):
+    """
+    Post-Processing of predicted scores based on Watershed.
+
+    Args:
+        thr_low: Scores below this value are background.
+        q_high: Scores above this quantile are foreground.
+        min_intensity: Only retain a segment if any part is > min_intensity
+    """
+
     def __init__(
         self,
         thr_low=0.5,
@@ -181,7 +198,7 @@ class WatershedPostProcessor(PostProcessor):
         )
 
 
-class Segmenter:
+class Segmenter(DefaultReprMixin):
     """
     Segmenter for images.
     """
