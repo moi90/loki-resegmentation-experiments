@@ -1,4 +1,3 @@
-from distutils.command.config import config
 import faulthandler
 import glob
 import gzip
@@ -6,12 +5,9 @@ import logging
 import os
 import pickle
 from functools import partial
-from time import time
 from typing import List, Mapping, Optional
 
 import experitur
-from experitur import configurators
-from experitur.core.experiment import SkipTrial
 import h5py
 import numpy as np
 import pandas as pd
@@ -28,24 +24,25 @@ import supervisely as sly
 import tqdm
 from envparse import env
 from experitur import Experiment, Trial
+from experitur.configurators import AdditiveConfiguratorChain, RandomGrid, SKOpt
 from experitur.core.configurators import Const
 from experitur.core.context import get_current_context
+from experitur.core.experiment import SkipTrial
 from sklearn.dummy import DummyClassifier
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.svm import LinearSVC
+from util import load_gz, save_gz
 from timer_cm import Timer
-from experitur.configurators import SKOpt, AdditiveConfiguratorChain, RandomGrid
 
+from _version import get_versions
 from segmenter import (
     DefaultPostProcessor,
-    WatershedPostProcessor,
     MinIntensityPreSelector,
     MultiscaleBasicFeatures,
     NullFeatures,
     Segmenter,
+    WatershedPostProcessor,
 )
-
-from _version import get_versions
 
 faulthandler.enable()
 
@@ -89,16 +86,6 @@ def load_dataset(path) -> pd.DataFrame:
     print(f"Loaded {len(data)} entries.")
 
     return data
-
-
-def save_gz(fn: str, array: np.ndarray):
-    with gzip.GzipFile(fn, "w") as f:
-        np.save(f, array)
-
-
-def load_gz(fn: str, **kwargs) -> np.ndarray:
-    with gzip.GzipFile(fn, "r") as f:
-        return np.load(f, **kwargs)
 
 
 @Experiment(meta=meta)
@@ -779,36 +766,36 @@ def train_eval(trial: Trial):
     return results.mean().to_dict()
 
 
-train_eval_optimize = Experiment(
-    parent=train_eval,
-    configurator=[
-        # Only evaluate the first split
-        Const(max_splits=1),
-        # Const(train_preselector_min_intensity=24, train_preselector_dilate=20),
-        SKOpt(
-            {
-                # "train_preselector_dilate": SKOpt.Categorical([None, 20]),
-                "extract_features_intensity": SKOpt.Categorical([True, False]),
-                # "train_preselector_min_intensity": SKOpt.Categorical(
-                #     [24, 32, 36, 48]  # 0, 12,
-                # ),
-                # "train_classifier_n_estimators": SKOpt.Categorical([10, 20, 30]),
-                # "train_classifier_max_depth": SKOpt.Categorical([10, 20, 30, 100]),
-                # "train_tset_bg_margin": SKOpt.Categorical([3, 5, 9]),
-                # "train_tset_bg_width": SKOpt.Categorical([7, 15, 31]),
-                "train_tset_equal_weight": SKOpt.Categorical([True, False]),
-                "eval_postprocessor_threshold": SKOpt.Categorical([0.5, 0.75, 0.8]),
-                "eval_postprocessor_smoothing": SKOpt.Categorical([0, 5, 10]),
-            },
-            # objective="px_iou",
-            # objective="px_bg_recall",  # Recognize background (light)
-            # objective="px_mean_recall",  # Optimize recall of foreground and background
-            objective="mean_iou",  # Optimize match of labeled regions
-            n_iter=10,
-        ),
-    ],
-    maximize=["px_iou", "px_bg_recall", "px_mean_recall", "mean_iou"],
-)
+# train_eval_optimize = Experiment(
+#     parent=train_eval,
+#     configurator=[
+#         # Only evaluate the first split
+#         Const(max_splits=1),
+#         # Const(train_preselector_min_intensity=24, train_preselector_dilate=20),
+#         SKOpt(
+#             {
+#                 # "train_preselector_dilate": SKOpt.Categorical([None, 20]),
+#                 "extract_features_intensity": SKOpt.Categorical([True, False]),
+#                 # "train_preselector_min_intensity": SKOpt.Categorical(
+#                 #     [24, 32, 36, 48]  # 0, 12,
+#                 # ),
+#                 # "train_classifier_n_estimators": SKOpt.Categorical([10, 20, 30]),
+#                 # "train_classifier_max_depth": SKOpt.Categorical([10, 20, 30, 100]),
+#                 # "train_tset_bg_margin": SKOpt.Categorical([3, 5, 9]),
+#                 # "train_tset_bg_width": SKOpt.Categorical([7, 15, 31]),
+#                 "train_tset_equal_weight": SKOpt.Categorical([True, False]),
+#                 "eval_postprocessor_threshold": SKOpt.Categorical([0.5, 0.75, 0.8]),
+#                 "eval_postprocessor_smoothing": SKOpt.Categorical([0, 5, 10]),
+#             },
+#             # objective="px_iou",
+#             # objective="px_bg_recall",  # Recognize background (light)
+#             # objective="px_mean_recall",  # Optimize recall of foreground and background
+#             objective="mean_iou",  # Optimize match of labeled regions
+#             n_iter=10,
+#         ),
+#     ],
+#     maximize=["px_iou", "px_bg_recall", "px_mean_recall", "mean_iou"],
+# )
 
 
 def _explore_options(options: Mapping, objective):
@@ -838,42 +825,98 @@ train_eval_optimize_watershed = Experiment(
         # Only evaluate the first split
         Const(max_splits=1),
         Const(
-            eval_postprocessor="WatershedPostProcessor",
-            eval_postprocessor_closing=15,
-            eval_postprocessor_thr_low=0.25,
-            eval_postprocessor_q_high=0.99,
-            eval_postprocessor_min_intensity=64,
-            eval_postprocessor_min_size=256,
-            eval_postprocessor_dilate_edges=5,
             train_tset_bg_width=15,
+            train_preselector_dilate=20,
+            eval_postprocessor="WatershedPostProcessor",
+            eval_postprocessor_closing=25,
+            eval_postprocessor_relative_closing=1,
+            eval_postprocessor_thr_low=0.25,
+            eval_postprocessor_q_high=0.97,
+            eval_postprocessor_min_intensity=64,
+            eval_postprocessor_min_size=256,  # Empirically determined from dataset (1% percentile)
+            eval_postprocessor_edges="image",
+            eval_postprocessor_dilate_edges=3,
+            eval_postprocessor_open_background=5,
+            eval_postprocessor_score_sigma=5,
+            eval_postprocessor_clear_background=False,
+            eval_postprocessor_q_low=0.5,
         ),
         _explore_options(
             {
-                "eval_postprocessor_min_size": [
-                    0,
-                    16,
-                    32,
-                    64,
-                    96,
-                    128,
-                    160,
-                    256,
-                    384,
-                    512,
-                    1024,
-                ],
-                # "eval_postprocessor_q_high": [0.95, 0.97, 0.99, 0.999],
-                # "eval_postprocessor_min_intensity": [0, 8, 16, 32, 64, 96, 128],
-                # "eval_postprocessor_dilate_edges": [0, 3, 5, 9, 17],
-                "eval_postprocessor_closing": [0, 10, 15, 20, 25, 50, 75, 100],
-                # "train_tset_bg_width": [7, 15, 31],
-                # "eval_postprocessor_thr_low": [0.125, 0.25, 0.50, 0.75]
+                "eval_postprocessor_edges": ["image", "scores"],
+                "train_preselector_dilate": [20, 50],
+                # "eval_postprocessor_min_size": [
+                #     0,
+                #     64,
+                #     128,
+                #     256,
+                # ],
+                "eval_postprocessor_thr_low": [0.125, 0.25, 0.35, 0.5, 0.75],
+                "eval_postprocessor_q_low": [0.25, 0.5, 0.75],
+                "eval_postprocessor_thr_high": [0.85, 0.90, 0.95, 0.99, 1.0],
+                "eval_postprocessor_q_high": [0.95, 0.97, 0.98, 0.99],
+                "eval_postprocessor_min_intensity": [0, 32, 64, 128],
+                "eval_postprocessor_dilate_edges": [0, 3, 5, 9],
+                # "eval_postprocessor_closing": [
+                #     0,
+                #     10,
+                #     25,
+                #     50,
+                #     75,
+                # ],
+                "eval_postprocessor_relative_closing": [0, 0.5, 1, 1.5],
+                "eval_postprocessor_open_background": [0, 5, 10],
+                "eval_postprocessor_score_sigma": [0, 5, 10],
+                "eval_postprocessor_clear_background": [True, False],
             },
             # objective="px_iou",
             # objective="px_bg_recall",  # Recognize background (light)
             # objective="px_mean_recall",  # Optimize recall of foreground and background
-            objective="mean_iou",  # Optimize match of labeled regions
+            objective="mean_bbox_iou",  # Optimize match of labeled regions
         ),
     ],
-    maximize=["px_iou", "px_bg_recall", "px_mean_recall", "mean_iou"],
+    maximize=["px_iou", "px_bg_recall", "px_mean_recall", "mean_iou", "mean_bbox_iou"],
+)
+
+train_eval_optimize_default_postprocessor = Experiment(
+    parent=train_eval,
+    configurator=[
+        # Only evaluate the first split
+        Const(max_splits=1),
+        Const(
+            train_tset_bg_width=15,
+            train_preselector_dilate=20,
+            eval_postprocessor="DefaultPostProcessor",
+            eval_postprocessor_threshold=0.5,
+            eval_postprocessor_smoothing=5,
+            eval_postprocessor_closing=10,
+            eval_postprocessor_min_intensity=64,
+            eval_postprocessor_min_size=256,  # Empirically determined from dataset (1% percentile)
+        ),
+        _explore_options(
+            {
+                "eval_postprocessor_threshold": [0.5, 0.8, 0.9, 0.99],
+                "eval_postprocessor_smoothing": [0, 5, 10],
+                "eval_postprocessor_closing": [
+                    0,
+                    10,
+                    25,
+                    50,
+                    75,
+                ],
+                "eval_postprocessor_min_intensity": [0, 32, 64, 128],
+                # "eval_postprocessor_min_size": [
+                #     0,
+                #     64,
+                #     128,
+                #     256,
+                # ],
+            },
+            # objective="px_iou",
+            # objective="px_bg_recall",  # Recognize background (light)
+            # objective="px_mean_recall",  # Optimize recall of foreground and background
+            objective="mean_bbox_iou",  # Optimize match of labeled regions
+        ),
+    ],
+    maximize=["px_iou", "px_bg_recall", "px_mean_recall", "mean_iou", "mean_bbox_iou"],
 )

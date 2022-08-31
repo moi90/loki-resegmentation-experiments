@@ -1,13 +1,15 @@
+import inspect
 from abc import ABC, abstractmethod
-from optparse import Option
-from typing import Optional
+from typing import Literal, Optional
+
 import numpy as np
+import scipy.ndimage as ndi
 import skimage.feature
+import skimage.filters
 import skimage.measure
 import skimage.morphology
-import skimage.filters
 import skimage.segmentation
-import inspect
+
 import isotropic
 
 
@@ -106,7 +108,16 @@ class PostProcessor(DefaultReprMixin, ABC):
         raise NotImplementedError()
 
 
-def _label_ex(mask_pred, image, min_size=0, closing=0, min_intensity=0):
+def _label_ex(
+    mask_pred,
+    image,
+    *,
+    min_size=0,
+    closing=0,
+    relative_closing=0,
+    min_intensity=0,
+    clear_background: Optional[np.ndarray] = None,
+):
     labels_pred = skimage.measure.label(mask_pred)
 
     if min_size or min_intensity:
@@ -115,9 +126,20 @@ def _label_ex(mask_pred, image, min_size=0, closing=0, min_intensity=0):
             if (r.intensity_max < min_intensity) or (r.area < min_size):
                 labels_pred[labels_pred == r.label] = 0
 
+    mask_pred = labels_pred > 0
+
+    if relative_closing:
+        # Close relative to maximum inner object diameter and relabel
+        dist = ndi.distance_transform_edt(mask_pred)
+        closing += dist.max() * relative_closing
+
     if closing:
         # Close and relabel
-        mask_pred = isotropic.isotropic_closing(labels_pred > 0, closing)
+        mask_pred = isotropic.isotropic_closing(mask_pred, closing)
+
+        if clear_background is not None:
+            mask_pred &= ~clear_background
+
         labels_pred = skimage.measure.label(mask_pred)
 
     return labels_pred
@@ -125,7 +147,13 @@ def _label_ex(mask_pred, image, min_size=0, closing=0, min_intensity=0):
 
 class DefaultPostProcessor(PostProcessor):
     def __init__(
-        self, threshold=0.5, smoothing=0, min_size=0, closing=0, min_intensity=0
+        self,
+        threshold=0.5,
+        smoothing=0,
+        min_size=0,
+        closing=0,
+        min_intensity=0,
+        relative_closing=0,
     ) -> None:
         super().__init__()
 
@@ -134,6 +162,7 @@ class DefaultPostProcessor(PostProcessor):
         self.min_size = min_size
         self.closing = closing
         self.min_intensity = min_intensity
+        self.relative_closing = relative_closing
 
     def __call__(self, scores: np.ndarray, image: np.ndarray) -> np.ndarray:
         if self.smoothing:
@@ -142,7 +171,12 @@ class DefaultPostProcessor(PostProcessor):
         mask_pred = scores > self.threshold
 
         return _label_ex(
-            mask_pred, image, self.min_size, self.closing, self.min_intensity
+            mask_pred,
+            image,
+            min_size=self.min_size,
+            closing=self.closing,
+            min_intensity=self.min_intensity,
+            relative_closing=self.relative_closing,
         )
 
 
@@ -154,25 +188,40 @@ class WatershedPostProcessor(PostProcessor):
         thr_low: Scores below this value are background.
         q_high: Scores above this quantile are foreground.
         min_intensity: Only retain a segment if any part is > min_intensity
+        open_background: Open background so that small background areas are deleted.
     """
 
     def __init__(
         self,
         thr_low=0.5,
+        q_low=0.5,
+        thr_high=0.9,
         q_high=0.99,
-        dilate_edges=3,
+        edges: Literal["image", "scores"] = "image",
+        dilate_edges=5,
         min_size=64,
         closing=10,
+        relative_closing=0,
         min_intensity=64,
+        clear_background=False,
+        open_background=5,
+        score_sigma=5,
     ) -> None:
         super().__init__()
 
         self.thr_low = thr_low
+        self.q_low = q_low
+        self.thr_high = thr_high
         self.q_high = q_high
+        self.edges = edges
         self.dilate_edges = dilate_edges
         self.min_size = min_size
         self.closing = closing
+        self.relative_closing = relative_closing
         self.min_intensity = min_intensity
+        self.clear_background = clear_background
+        self.open_background = open_background
+        self.score_sigma = score_sigma
 
     def _edges(self, image: np.ndarray):
         if self.dilate_edges:
@@ -182,19 +231,50 @@ class WatershedPostProcessor(PostProcessor):
         return skimage.filters.sobel(image)
 
     def __call__(self, scores: np.ndarray, image: np.ndarray) -> np.ndarray:
-        thr_high = np.quantile(scores, self.q_high)
+        if self.score_sigma:
+            # Smooth scores smooth the quantile calculation
+            scores = skimage.filters.gaussian(scores, self.score_sigma)
+
+        thr_low_, thr_high_ = np.quantile(scores, [self.q_low, self.q_high])
+
+        # Take maximum of thr_low and q_low to ensure that at least a bit background is visible
+        thr_low = max(self.thr_low, thr_low_)
+        # Take minimum of thr_high and q_high quantile to ensure that at least some object is visible
+        thr_high = min(self.thr_high, thr_high_)
+
         markers = np.zeros(scores.shape, dtype="uint8")
         FOREGROUND, BACKGROUND = 1, 2
 
-        markers[scores > thr_high] = FOREGROUND
-        markers[scores < self.thr_low] = BACKGROUND
+        mask_foreground = scores > thr_high
+        markers[mask_foreground] = FOREGROUND
 
-        edges = self._edges(image)
+        mask_background = scores < thr_low
+        if self.open_background:
+            mask_background = isotropic.isotropic_opening(
+                mask_background, self.open_background
+            )
+        markers[mask_background] = BACKGROUND
 
-        mask_pred = skimage.segmentation.watershed(edges, markers) == FOREGROUND
+        if self.edges == "image":
+            edges = self._edges(image)
+        elif self.edges == "scores":
+            edges = self._edges(scores)
+        else:
+            raise ValueError(f"Unknown edges: {self.edges!r}")
+
+        ws = skimage.segmentation.watershed(edges, markers)
+        mask_pred = ws == FOREGROUND
+
+        clear_background = ws == BACKGROUND if self.clear_background else None
 
         return _label_ex(
-            mask_pred, image, self.min_size, self.closing, self.min_intensity
+            mask_pred,
+            image,
+            min_size=self.min_size,
+            closing=self.closing,
+            relative_closing=self.relative_closing,
+            min_intensity=self.min_intensity,
+            clear_background=clear_background,
         )
 
 
