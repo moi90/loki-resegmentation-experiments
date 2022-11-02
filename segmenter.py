@@ -328,3 +328,15 @@ class Segmenter(DefaultReprMixin):
 
     def postprocess(self, mask: np.ndarray, image: np.ndarray):
         return self.postprocessor(mask, image)
+
+    def configure(self, **kwargs):
+        """
+        Configure the underlying objects.
+
+        Arguments include n_jobs, verbose, ...
+        """
+        for name in ("feature_extractor", "classifier", "postprocessor", "preselector"):
+            obj = getattr(self, name)
+            for k, v in kwargs.items():
+                if hasattr(obj, k):
+                    setattr(obj, k, v)

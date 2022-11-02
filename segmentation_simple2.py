@@ -695,7 +695,7 @@ def run_stage(
 # prepare_train_min_intensity=24,
 @Experiment(
     configurator=Const(
-        dataset_path="data/22-06-14-LOKI",
+        dataset_path="data/22-11-02-LOKI-raw",
         dataset_nsplits=5,
         dataset_groupby="node_id",
         # Debug
@@ -825,8 +825,11 @@ train_eval_optimize_watershed = Experiment(
         # Only evaluate the first split
         Const(max_splits=1),
         Const(
+            # Training
             train_tset_bg_width=15,
             train_preselector_dilate=20,
+            train_classifier_max_depth=20,
+            # Postprocessing
             eval_postprocessor="WatershedPostProcessor",
             eval_postprocessor_closing=25,
             eval_postprocessor_relative_closing=1,
@@ -843,8 +846,13 @@ train_eval_optimize_watershed = Experiment(
         ),
         _explore_options(
             {
-                "eval_postprocessor_edges": ["image", "scores"],
+                # Classifier
+                # "train_classifier_n_estimators": [10, 20],
+                "train_classifier_max_depth": [10, 20, 30],
                 "train_preselector_dilate": [20, 50],
+                "train_tset_equal_weight": [True, False],
+                # Postprocessor
+                "eval_postprocessor_edges": ["image", "scores"],
                 # "eval_postprocessor_min_size": [
                 #     0,
                 #     64,
@@ -867,7 +875,7 @@ train_eval_optimize_watershed = Experiment(
                 "eval_postprocessor_relative_closing": [0, 0.5, 1, 1.5],
                 "eval_postprocessor_open_background": [0, 5, 10],
                 "eval_postprocessor_score_sigma": [0, 5, 10],
-                "eval_postprocessor_clear_background": [True, False],
+                # "eval_postprocessor_clear_background": [True, False],
             },
             # objective="px_iou",
             # objective="px_bg_recall",  # Recognize background (light)
@@ -920,3 +928,80 @@ train_eval_optimize_default_postprocessor = Experiment(
     ],
     maximize=["px_iou", "px_bg_recall", "px_mean_recall", "mean_iou", "mean_bbox_iou"],
 )
+
+
+@Experiment(
+    configurator=Const(
+        dataset_path="data/22-06-14-LOKI",
+        eval_postprocessor="WatershedPostProcessor",
+        eval_postprocessor_closing=25,  # Larger values reduce minimum performance
+    ),
+    meta=meta,
+)
+def train_export_full(trial: Trial):
+
+    train_eval_trial = (
+        (
+            get_current_context()
+            .get_trials(
+                func="segmentation_simple2.train_eval",
+                parameters=trial.todict(),
+            )
+            .filter(lambda trial: trial.is_successful)
+        )
+        .best_n(1, maximize="mean_bbox_iou")
+        .one()
+    )
+
+    dataset_trial = run_stage(
+        train_eval_trial.prefixed("dataset_"),
+        dataset,
+    )
+
+    extract_features_trial = run_stage(
+        train_eval_trial.prefixed("extract_features_"),
+        extract_features,
+        dataset_trial_id=dataset_trial.id,
+    )
+
+    evaluate_postprocessor_trial = (
+        get_current_context()
+        .get_trials(
+            "segmentation_simple2.evaluate_postprocessor",
+            parameters=train_eval_trial.prefixed("eval_"),
+        )
+        .one()
+    )
+
+    segmenter_fn = evaluate_postprocessor_trial.find_file("segmenter.pkl.gz")
+    with gzip.open(segmenter_fn, "rb") as f:
+        segmenter: Segmenter = pickle.load(f)
+
+    print("Segmenter:")
+    print(" Feature Extractor:", segmenter.feature_extractor)
+    print(" Preselector:", segmenter.preselector)
+    print(" Classifier:", segmenter.classifier)
+    print(" Postprocessor:", segmenter.postprocessor)
+
+    # Train on full dataset
+    train_trial = run_stage(
+        train_eval_trial.prefixed("train_"),
+        train,
+        split=None,
+        extract_features_trial_id=extract_features_trial.id,
+        fast_n=trial.get("fast_n"),
+    )
+
+    # Load classifier
+    classifier_fn = train_trial.find_file("classifier.pkl.gz")
+    with gzip.open(classifier_fn, "rb") as f:
+        classifier = pickle.load(f)
+
+    # Update classifier
+    segmenter.classifier = classifier
+
+    # Save segmenter
+    segmenter_fn = trial.file("segmenter.pkl.gz")
+    gz_dump(segmenter_fn, segmenter)
+
+    print("Segmenter saved as:", segmenter_fn)
