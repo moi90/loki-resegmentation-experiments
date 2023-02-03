@@ -25,7 +25,7 @@ import tqdm
 from envparse import env
 from experitur import Experiment, Trial
 from experitur.configurators import AdditiveConfiguratorChain, RandomGrid, SKOpt
-from experitur.core.configurators import Const
+from experitur.core.configurators import Const, Reset
 from experitur.core.context import get_current_context
 from experitur.core.experiment import SkipTrial
 from sklearn.dummy import DummyClassifier
@@ -33,6 +33,7 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.svm import LinearSVC
 from util import load_gz, save_gz
 from timer_cm import Timer
+from sklearn.linear_model import LogisticRegression
 
 from _version import get_versions
 from segmenter import (
@@ -92,8 +93,9 @@ def load_dataset(path) -> pd.DataFrame:
 def dataset(trial: Trial):
 
     project = sly.read_single_project(trial["path"])
-    foreground_class = trial.get("foreground_class", "Organism")
-    background_class = trial.get("background_class", "Light")
+    foreground_class = trial.get("foreground_class", "Foreground")
+    background_class = trial.get("background_class", "Background")
+    relabel = trial.get("relabel", False)
 
     data = {}
 
@@ -131,8 +133,13 @@ def dataset(trial: Trial):
                 elif label.obj_class.name == background_class:
                     class_image[sl][mask] = 0
 
+            if relabel:
+                # Relabel the image
+                # This merges connected regions and splits disconnected regions
+                label_image = skimage.measure.label(class_image)
+
             assert (class_image == 1).any(), f"{item_name} has no foreground pixels"
-            assert (class_image > 0).any(), f"{item_name} has no foreground regions"
+            assert (label_image > 0).any(), f"{item_name} has no labeled regions"
 
             labels_fn = os.path.join(labels_dir, item_id + ".np.gz")
             save_gz(labels_fn, label_image)
@@ -187,7 +194,7 @@ def extract_features(trial: Trial):
     dataset = pd.read_csv(dataset_trial.find_file("dataset.csv"), index_col=0)
 
     cls = trial.choice("cls", [MultiscaleBasicFeatures, NullFeatures])
-    feature_extractor = trial.call(cls)
+    feature_extractor = trial.prefixed(f"{cls.__name__}_").call(cls)
 
     # Save feature extractor
     gz_dump(trial.file("feature_extractor.pkl.gz"), feature_extractor)
@@ -284,7 +291,7 @@ def _configure(obj, **kwargs):
             setattr(obj, k, v)
 
 
-@Experiment(meta=meta)
+@Experiment(meta=meta, maximize=["fgAP"])
 def train(trial: Trial):
     extract_features_trial = experitur.get_trial(trial["extract_features_trial_id"])
     dataset_trial = experitur.get_trial(extract_features_trial["dataset_trial_id"])
@@ -307,16 +314,21 @@ def train(trial: Trial):
     preselector = (
         None
         if preselector_cls is None
-        else trial.prefixed("preselector_").call(preselector_cls)
+        else trial.prefixed(f"preselector_{preselector_cls.__name__}_").call(
+            preselector_cls
+        )
     )
 
     # Save preselector
     gz_dump(trial.file("preselector.pkl.gz"), preselector)
 
     classifier_cls = trial.choice(
-        "classifier", [RandomForestClassifier, LinearSVC, DummyClassifier]
+        "classifier",
+        [RandomForestClassifier, LinearSVC, DummyClassifier, LogisticRegression],
     )
-    classifier = trial.prefixed("classifier_").call(classifier_cls)
+    classifier = trial.prefixed(f"classifier_{classifier_cls.__name__}_").call(
+        classifier_cls
+    )
 
     # Configure classifier for training
     _configure(classifier, n_jobs=N_JOBS, verbose=1)
@@ -344,9 +356,17 @@ def train(trial: Trial):
     # Save classifier
     classifier_size = gz_dump(trial.file("classifier.pkl.gz"), classifier)
 
+    # Set to single-threaded for prediction performance evaluation
+    _configure(classifier, n_jobs=1)
+
     print("Evaluating classifier...")
     with Timer("predict") as t_predict:
         y_pred = classifier.predict(X)
+
+    if hasattr(classifier, "predict_proba"):
+        probs = classifier.predict_proba(X)[:, 1]
+        fgAP = sklearn.metrics.average_precision_score(y == 1, probs)
+        trial.update_result(fgAP=fgAP)
 
     # Evaluate (without post-processing)
     (
@@ -593,7 +613,9 @@ def evaluate_postprocessor(trial: Trial):
     postprocessor_cls = trial.choice(
         "postprocessor", [DefaultPostProcessor, WatershedPostProcessor]
     )
-    postprocessor = trial.prefixed("postprocessor_").call(postprocessor_cls)
+    postprocessor = trial.prefixed(f"postprocessor_{postprocessor_cls.__name__}_").call(
+        postprocessor_cls
+    )
 
     segmenter = Segmenter(
         feature_extractor=feature_extractor,
@@ -664,10 +686,12 @@ def evaluate_postprocessor(trial: Trial):
 
     results = pd.DataFrame(results).set_index("id", drop=True)
     results.to_csv(trial.file("scores.csv"))
+    summary = summarize(results, percentiles=[0.05, 0.1, 0.5, 0.9])
 
     return {
         "t_eval": time_eval,
         **results.mean(axis=0, numeric_only=True).to_dict(),
+        **summary,
     }
 
 
@@ -703,22 +727,22 @@ def run_stage(
         max_splits=None,
         eval_draw_segmentation=False,
         # Feature Extractor
-        extract_features_sigma_max=32,
-        extract_features_edges=True,
-        extract_features_intensity=True,
-        extract_features_texture=True,
+        extract_features_MultiscaleBasicFeatures_sigma_max=16,
+        extract_features_MultiscaleBasicFeatures_edges=True,
+        extract_features_MultiscaleBasicFeatures_intensity=True,
+        extract_features_MultiscaleBasicFeatures_texture=True,
         # Training set preparation
         train_tset_bg_margin=5,
         train_tset_bg_width=15,
         train_tset_equal_weight=False,
         # Preselector
         train_preselector="MinIntensityPreSelector",
-        train_preselector_min_intensity=24,
-        train_preselector_dilate=20,
+        train_preselector_MinIntensityPreSelector_min_intensity=24,
+        train_preselector_MinIntensityPreSelector_dilate=20,
         # Classifier
         train_classifier="RandomForestClassifier",
-        train_classifier_max_depth=10,
-        train_classifier_n_estimators=10,
+        train_classifier_RandomForestClassifier_max_depth=5,
+        train_classifier_RandomForestClassifier_n_estimators=10,
     ),
     meta=meta,
 )
@@ -763,39 +787,9 @@ def train_eval(trial: Trial):
     results = pd.DataFrame(results)
     results.to_csv(trial.file("results.csv"))
 
+    # TODO: Sum up times
+
     return results.mean().to_dict()
-
-
-# train_eval_optimize = Experiment(
-#     parent=train_eval,
-#     configurator=[
-#         # Only evaluate the first split
-#         Const(max_splits=1),
-#         # Const(train_preselector_min_intensity=24, train_preselector_dilate=20),
-#         SKOpt(
-#             {
-#                 # "train_preselector_dilate": SKOpt.Categorical([None, 20]),
-#                 "extract_features_intensity": SKOpt.Categorical([True, False]),
-#                 # "train_preselector_min_intensity": SKOpt.Categorical(
-#                 #     [24, 32, 36, 48]  # 0, 12,
-#                 # ),
-#                 # "train_classifier_n_estimators": SKOpt.Categorical([10, 20, 30]),
-#                 # "train_classifier_max_depth": SKOpt.Categorical([10, 20, 30, 100]),
-#                 # "train_tset_bg_margin": SKOpt.Categorical([3, 5, 9]),
-#                 # "train_tset_bg_width": SKOpt.Categorical([7, 15, 31]),
-#                 "train_tset_equal_weight": SKOpt.Categorical([True, False]),
-#                 "eval_postprocessor_threshold": SKOpt.Categorical([0.5, 0.75, 0.8]),
-#                 "eval_postprocessor_smoothing": SKOpt.Categorical([0, 5, 10]),
-#             },
-#             # objective="px_iou",
-#             # objective="px_bg_recall",  # Recognize background (light)
-#             # objective="px_mean_recall",  # Optimize recall of foreground and background
-#             objective="mean_iou",  # Optimize match of labeled regions
-#             n_iter=10,
-#         ),
-#     ],
-#     maximize=["px_iou", "px_bg_recall", "px_mean_recall", "mean_iou"],
-# )
 
 
 def _explore_options(options: Mapping, objective):
@@ -819,63 +813,198 @@ def _explore_options(options: Mapping, objective):
     return AdditiveConfiguratorChain(*configurators, shuffle=True)
 
 
+train_eval_optimize = Experiment(
+    parent=train_eval,
+    configurator=[
+        # Only evaluate the first split
+        Const(max_splits=1),
+        AdditiveConfiguratorChain(
+            _explore_options(
+                {
+                    # Preselector
+                    "train_preselector_MinIntensityPreSelector_min_intensity": [
+                        6,
+                        12,
+                        24,
+                    ],
+                    "train_preselector_MinIntensityPreSelector_dilate": [10, 20, 40],
+                    # TSet Builder
+                    "train_tset_bg_margin": [3, 5, 10],
+                    "train_tset_bg_width": [7, 15, 30],
+                    "train_tset_equal_weight": [True, False],
+                    # Feature Extractor
+                    "extract_features_MultiscaleBasicFeatures_edges": [True, False],
+                    "extract_features_MultiscaleBasicFeatures_intensity": [True, False],
+                    "extract_features_MultiscaleBasicFeatures_sigma_max": [16, 32, 48],
+                    "extract_features_MultiscaleBasicFeatures_texture": [True, False],
+                    # Classifier
+                    "train_classifier_RandomForestClassifier_max_depth": [
+                        5,
+                        10,
+                        20,
+                    ],
+                    "train_classifier_RandomForestClassifier_n_estimators": [
+                        5,
+                        10,
+                        20,
+                    ],
+                },
+                objective="mean_bbox_iou",
+            ),
+            # Alternative Preselector
+            # Reset("train_preselector*") * Const(train_preselector="None"),
+            # Alternative Classifier
+            Reset("train_classifier*") * Const(train_classifier="LinearSVC"),
+        )
+        # SKOpt(
+        #     {
+        #         "eval_postprocessor_threshold": SKOpt.Categorical([0.5, 0.75, 0.8]),
+        #         "eval_postprocessor_smoothing": SKOpt.Categorical([0, 5, 10]),
+        #     },
+        #     # objective="px_iou",
+        #     # objective="px_bg_recall",  # Recognize background (light)
+        #     # objective="px_mean_recall",  # Optimize recall of foreground and background
+        #     objective="mean_iou",  # Optimize match of labeled regions
+        #     n_iter=10,
+        # ),
+    ],
+    maximize=["px_iou", "px_bg_recall", "px_mean_recall", "mean_iou"],
+)
+
+
 train_eval_optimize_watershed = Experiment(
     parent=train_eval,
     configurator=[
         # Only evaluate the first split
         Const(max_splits=1),
         Const(
-            # Training
+            # Preselector
+            train_preselector="MinIntensityPreSelector",
+            train_preselector_MinIntensityPreSelector_dilate=20,
+            train_preselector_MinIntensityPreSelector_min_intensity=24,
+            # Training Set
+            train_tset_bg_margin=5,
             train_tset_bg_width=15,
-            train_preselector_dilate=20,
-            train_classifier_max_depth=20,
+            train_tset_equal_weight=False,
+            # Classifier
+            train_classifier_RandomForestClassifier_max_depth=5,
+            train_classifier_RandomForestClassifier_n_estimators=10,
+            # Feature Extractor
+            extract_features_MultiscaleBasicFeatures_edges=True,
+            extract_features_MultiscaleBasicFeatures_intensity=True,
+            extract_features_MultiscaleBasicFeatures_num_sigma=None,
+            extract_features_MultiscaleBasicFeatures_sigma_max=16,
+            extract_features_MultiscaleBasicFeatures_sigma_min=0.5,
+            extract_features_MultiscaleBasicFeatures_texture=True,
+            extract_features_cls="MultiscaleBasicFeatures",
             # Postprocessing
             eval_postprocessor="WatershedPostProcessor",
-            eval_postprocessor_closing=25,
-            eval_postprocessor_relative_closing=1,
-            eval_postprocessor_thr_low=0.25,
-            eval_postprocessor_q_high=0.97,
-            eval_postprocessor_min_intensity=64,
-            eval_postprocessor_min_size=256,  # Empirically determined from dataset (1% percentile)
-            eval_postprocessor_edges="image",
-            eval_postprocessor_dilate_edges=3,
-            eval_postprocessor_open_background=5,
-            eval_postprocessor_score_sigma=5,
-            eval_postprocessor_clear_background=False,
-            eval_postprocessor_q_low=0.5,
+            eval_postprocessor_WatershedPostProcessor_clear_background=False,
+            eval_postprocessor_WatershedPostProcessor_closing=25,
+            eval_postprocessor_WatershedPostProcessor_dilate_edges=5,
+            eval_postprocessor_WatershedPostProcessor_edges="scores",
+            eval_postprocessor_WatershedPostProcessor_min_intensity=64,
+            eval_postprocessor_WatershedPostProcessor_min_size=256,  # Empirically determined from dataset (1% percentile)
+            eval_postprocessor_WatershedPostProcessor_open_background=0,
+            eval_postprocessor_WatershedPostProcessor_q_high=0.99,
+            eval_postprocessor_WatershedPostProcessor_q_low=0.5,
+            eval_postprocessor_WatershedPostProcessor_relative_closing=0.0,
+            eval_postprocessor_WatershedPostProcessor_score_sigma=5,
+            eval_postprocessor_WatershedPostProcessor_thr_high=0.85,
+            eval_postprocessor_WatershedPostProcessor_thr_low=0.75,
+        ),
+        (
+            Const()
+            + (
+                Reset("train_classifier*")
+                * Const(train_classifier="LogisticRegression")
+            )
         ),
         _explore_options(
             {
-                # Classifier
-                # "train_classifier_n_estimators": [10, 20],
-                "train_classifier_max_depth": [10, 20, 30],
-                "train_preselector_dilate": [20, 50],
+                # Preselector
+                "train_preselector_MinIntensityPreSelector_min_intensity": [
+                    6,
+                    12,
+                    24,
+                ],
+                "train_preselector_MinIntensityPreSelector_dilate": [10, 20, 40],
+                # TSet Builder
+                "train_tset_bg_margin": [3, 5, 10],
+                "train_tset_bg_width": [7, 15, 30],
                 "train_tset_equal_weight": [True, False],
+                # Feature Extractor
+                "extract_features_MultiscaleBasicFeatures_edges": [True, False],
+                "extract_features_MultiscaleBasicFeatures_intensity": [True, False],
+                "extract_features_MultiscaleBasicFeatures_sigma_max": [16, 32, 48],
+                "extract_features_MultiscaleBasicFeatures_texture": [True, False],
+                # Classifier
+                "train_classifier_RandomForestClassifier_max_depth": [
+                    5,
+                    10,
+                    20,
+                    30,
+                ],
+                "train_classifier_RandomForestClassifier_n_estimators": [
+                    5,
+                    10,
+                    20,
+                ],
                 # Postprocessor
-                "eval_postprocessor_edges": ["image", "scores"],
-                # "eval_postprocessor_min_size": [
+                "eval_postprocessor_WatershedPostProcessor_edges": ["image", "scores"],
+                # "eval_postprocessor_WatershedPostProcessor_min_size": [
                 #     0,
                 #     64,
                 #     128,
                 #     256,
                 # ],
-                "eval_postprocessor_thr_low": [0.125, 0.25, 0.35, 0.5, 0.75],
-                "eval_postprocessor_q_low": [0.25, 0.5, 0.75],
-                "eval_postprocessor_thr_high": [0.85, 0.90, 0.95, 0.99, 1.0],
-                "eval_postprocessor_q_high": [0.95, 0.97, 0.98, 0.99],
-                "eval_postprocessor_min_intensity": [0, 32, 64, 128],
-                "eval_postprocessor_dilate_edges": [0, 3, 5, 9],
-                # "eval_postprocessor_closing": [
-                #     0,
-                #     10,
-                #     25,
-                #     50,
-                #     75,
-                # ],
-                "eval_postprocessor_relative_closing": [0, 0.5, 1, 1.5],
-                "eval_postprocessor_open_background": [0, 5, 10],
-                "eval_postprocessor_score_sigma": [0, 5, 10],
-                # "eval_postprocessor_clear_background": [True, False],
+                "eval_postprocessor_WatershedPostProcessor_thr_low": [
+                    0.125,
+                    0.25,
+                    0.35,
+                    0.5,
+                    0.75,
+                ],
+                "eval_postprocessor_WatershedPostProcessor_q_low": [0.25, 0.5, 0.75],
+                "eval_postprocessor_WatershedPostProcessor_thr_high": [
+                    0.85,
+                    0.90,
+                    0.95,
+                    0.99,
+                    1.0,
+                ],
+                "eval_postprocessor_WatershedPostProcessor_q_high": [
+                    0.95,
+                    0.97,
+                    0.98,
+                    0.99,
+                ],
+                "eval_postprocessor_WatershedPostProcessor_min_intensity": [
+                    0,
+                    32,
+                    64,
+                    128,
+                ],
+                "eval_postprocessor_WatershedPostProcessor_dilate_edges": [0, 3, 5, 9],
+                "eval_postprocessor_WatershedPostProcessor_closing": [
+                    0,
+                    10,
+                    25,
+                    #     50,
+                    #     75,
+                ],
+                "eval_postprocessor_WatershedPostProcessor_relative_closing": [
+                    0,
+                    0.5,
+                    1,
+                    1.5,
+                ],
+                "eval_postprocessor_WatershedPostProcessor_open_background": [0, 5, 10],
+                "eval_postprocessor_WatershedPostProcessor_score_sigma": [0, 5, 10],
+                "eval_postprocessor_WatershedPostProcessor_clear_background": [
+                    True,
+                    False,
+                ],
             },
             # objective="px_iou",
             # objective="px_bg_recall",  # Recognize background (light)
@@ -892,28 +1021,94 @@ train_eval_optimize_default_postprocessor = Experiment(
         # Only evaluate the first split
         Const(max_splits=1),
         Const(
+            # Feature Extractor
+            extract_features_MultiscaleBasicFeatures_edges=True,
+            extract_features_MultiscaleBasicFeatures_intensity=True,
+            extract_features_MultiscaleBasicFeatures_sigma_max=16,
+            extract_features_MultiscaleBasicFeatures_sigma_min=0.5,
+            extract_features_MultiscaleBasicFeatures_texture=True,
+            extract_features_cls="MultiscaleBasicFeatures",
+            # Preselector
+            train_preselector="MinIntensityPreSelector",
+            train_preselector_MinIntensityPreSelector_dilate=20,
+            train_preselector_MinIntensityPreSelector_min_intensity=24,
+            # Training Set
+            train_tset_bg_margin=5,
             train_tset_bg_width=15,
-            train_preselector_dilate=20,
+            train_tset_equal_weight=False,
+            # Classifier
+            train_classifier="RandomForestClassifier",
+            train_classifier_RandomForestClassifier_max_depth=20,
+            train_classifier_RandomForestClassifier_n_estimators=10,
+            # Post-Processor
             eval_postprocessor="DefaultPostProcessor",
-            eval_postprocessor_threshold=0.5,
-            eval_postprocessor_smoothing=5,
-            eval_postprocessor_closing=10,
-            eval_postprocessor_min_intensity=64,
-            eval_postprocessor_min_size=256,  # Empirically determined from dataset (1% percentile)
+            eval_postprocessor_DefaultPostProcessor_closing=10,
+            eval_postprocessor_DefaultPostProcessor_min_intensity=64,
+            # Empirically determined from dataset (1% percentile)
+            eval_postprocessor_DefaultPostProcessor_min_size=256,
+            eval_postprocessor_DefaultPostProcessor_relative_closing=0,
+            eval_postprocessor_DefaultPostProcessor_smoothing=5,
+            eval_postprocessor_DefaultPostProcessor_threshold=0.5,
+        ),
+        (
+            Const()
+            + (
+                Reset("train_classifier*")
+                * Const(train_classifier="LogisticRegression")
+            )
         ),
         _explore_options(
             {
-                "eval_postprocessor_threshold": [0.5, 0.8, 0.9, 0.99],
-                "eval_postprocessor_smoothing": [0, 5, 10],
-                "eval_postprocessor_closing": [
+                # Preselector
+                "train_preselector_MinIntensityPreSelector_min_intensity": [
+                    6,
+                    12,
+                    24,
+                ],
+                "train_preselector_MinIntensityPreSelector_dilate": [10, 20, 40],
+                # TSet Builder
+                "train_tset_bg_margin": [3, 5, 10],
+                "train_tset_bg_width": [7, 15, 30],
+                "train_tset_equal_weight": [True, False],
+                # Feature Extractor
+                "extract_features_MultiscaleBasicFeatures_edges": [True, False],
+                "extract_features_MultiscaleBasicFeatures_intensity": [True, False],
+                "extract_features_MultiscaleBasicFeatures_sigma_max": [16, 32, 48],
+                "extract_features_MultiscaleBasicFeatures_texture": [True, False],
+                # # Classifier
+                # "train_classifier_RandomForestClassifier_max_depth": [
+                #     5,
+                #     10,
+                #     20,
+                #     30,
+                # ],
+                # "train_classifier_RandomForestClassifier_n_estimators": [
+                #     5,
+                #     10,
+                #     20,
+                # ],
+                # Post Processor
+                "eval_postprocessor_DefaultPostProcessor_threshold": [
+                    0.5,
+                    0.8,
+                    0.9,
+                    0.99,
+                ],
+                "eval_postprocessor_DefaultPostProcessor_smoothing": [0, 5, 10],
+                "eval_postprocessor_DefaultPostProcessor_closing": [
                     0,
                     10,
                     25,
                     50,
                     75,
                 ],
-                "eval_postprocessor_min_intensity": [0, 32, 64, 128],
-                # "eval_postprocessor_min_size": [
+                "eval_postprocessor_DefaultPostProcessor_min_intensity": [
+                    0,
+                    32,
+                    64,
+                    128,
+                ],
+                # "eval_postprocessor_DefaultPostProcessor_min_size": [
                 #     0,
                 #     64,
                 #     128,
@@ -932,9 +1127,9 @@ train_eval_optimize_default_postprocessor = Experiment(
 
 @Experiment(
     configurator=Const(
-        dataset_path="data/22-06-14-LOKI",
+        dataset_path="data/22-11-02-LOKI-raw",
         eval_postprocessor="WatershedPostProcessor",
-        eval_postprocessor_closing=25,  # Larger values reduce minimum performance
+        eval_postprocessor_WatershedPostProcessor_closing=25,  # Larger values reduce minimum performance
     ),
     meta=meta,
 )
