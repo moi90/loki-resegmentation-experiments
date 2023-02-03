@@ -1,0 +1,24 @@
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python
+  - scikit-image
+  - scikit-learn
+  - matplotlib
+  - pillow
+  - numpy
+  - pandas
+  - joblib
+  - h5py
+  - pip
+  - notebook
+  - jupyter_contrib_nbextensions
+  - ipympl
+  - black
+  - pip:
+    - shapely
+    - timer_cm
+    - natsort
+    - supervisely
+    - envparse
